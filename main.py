@@ -2,18 +2,12 @@ import json
 import spotipy
 from spotipy.oauth2 import (
     SpotifyOAuth,
-    # SpotifyClientCredentials,
 )
-
-# export SPOTIPY_CLIENT_ID="198ef5c30dd0475d8d5a1e0a8ef3b4d5"
-# export SPOTIPY_CLIENT_SECRET="64db4fefa5d84c16853407e4388e9c7c"
-# export SPOTIPY_REDIRECT_URI="http://example.com"
 
 class SpotifyClient():
     def __init__(self):
         self.username = "anarchy.puppy19"
         self.scope = "playlist-read-private"
-        # self.auth_manager = SpotifyClientCredentials()
         self.auth_manager = SpotifyOAuth(
             scope=self.scope,
             open_browser=False,
@@ -101,7 +95,4 @@ class SpotifyClient():
 
 if __name__ == "__main__":
     client = SpotifyClient()
-    #client.set_playlists()
-    #client.set_snapshot_map()
-    #client.dump_snapshot_map()
     client.get_snapshot_diff()
