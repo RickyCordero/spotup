@@ -1,8 +1,13 @@
+import os
+from pathlib import (
+    Path,
+)
 import json
 import spotipy
 from spotipy.oauth2 import (
     SpotifyOAuth,
 )
+from spotdl import Spotdl
 
 class SpotifyClient():
     def __init__(self):
@@ -33,7 +38,7 @@ class SpotifyClient():
         if self.playlists['next']:
             self.playlists = self.sp.next(self.playlists)
         else:
-            self.playlists = None 
+            self.playlists = None
     
     def set_snapshot_map(self):
         self.snapshot_map = self.build_snapshot_map()
@@ -66,6 +71,7 @@ class SpotifyClient():
         self.dump_map(self.snapshot_map)
 
     def get_snapshot_diff(self):
+        playlists_to_update = []
         try:
             prev_map = self.load_snapshot_map()
         except Exception as err:
@@ -82,17 +88,46 @@ class SpotifyClient():
                     if curr_snapshot_id != prev_snapshot_id:
                         print(f"Playlist '{k}' was updated. Download again: {curr_obj}")
                         count += 1
+                        playlists_to_update.append({"name": k, "url": curr_obj.get("url")})
                 else:
                     print(f"Playlist '{k}' was added/removed")
         print(f"{count} playlists should be updated.")
         self.dump_map(curr_map)
+        return playlists_to_update
 
     def load_snapshot_map(self):
         with open("snapshot_map.json") as snapshot_file:
             return json.loads(snapshot_file.read())
 
+class SpotdlClient():
+
+    def __init__(self):
+        self.spotify_client = SpotifyClient()
+        self.spotdl = Spotdl(
+            client_id=os.environ.get("SPOTIPY_CLIENT_ID"),
+            client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET"),
+            threads=8,
+        )
     
+    def download(self):
+        playlists_to_update = self.spotify_client.get_snapshot_diff()
+        for playlist_obj in playlists_to_update:
+            playlist_name = playlist_obj.get("name")
+            output_dir = f'./{playlist_name}'
+            print(f"Looking for folder '{output_dir}'")
+            if not Path(output_dir).exists():
+                print(f"Folder {output_dir} does not exist, creating...")
+                Path(output_dir).mkdir(exist_ok=True)
+                print(f"Successfully created folder '{output_dir}'")
+            playlist_url = playlist_obj.get("url")
+            print(f"Searching for playlist '{playlist_name}' ({playlist_url})")
+            songs = self.spotdl.search([
+                playlist_url,
+            ])
+            print(f"Downloading {len(songs)} songs...")
+            self.spotdl.downloader.output = output_dir
+            results = self.spotdl.download_songs(songs)
 
 if __name__ == "__main__":
-    client = SpotifyClient()
-    client.get_snapshot_diff()
+    spotdl_client = SpotdlClient()
+    spotdl_client.download()
