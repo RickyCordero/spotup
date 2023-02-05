@@ -9,9 +9,11 @@ from spotipy.oauth2 import (
 )
 from spotdl import Spotdl
 
+BASE_PATH = os.environ.get("BASE_PATH")
+
 class SpotifyClient():
     def __init__(self):
-        self.username = "anarchy.puppy19"
+        self.username = os.environ.get("USERNAME") 
         self.scope = "playlist-read-private"
         self.auth_manager = SpotifyOAuth(
             scope=self.scope,
@@ -49,7 +51,7 @@ class SpotifyClient():
         while playlists is not None:
             for playlist_obj in playlists.get("items"):
                 owner_id = playlist_obj.get("owner").get("id")
-                if owner_id == "anarchy.puppy19":
+                if owner_id == self.username:
                     snapshot_id = playlist_obj.get("snapshot_id")
                     name = playlist_obj.get("name")
                     url = playlist_obj.get("external_urls").get("spotify")
@@ -113,7 +115,7 @@ class SpotdlClient():
         playlists_to_update = self.spotify_client.get_snapshot_diff()
         for playlist_obj in playlists_to_update:
             playlist_name = playlist_obj.get("name")
-            output_dir = f'./{playlist_name}'
+            output_dir = f'{BASE_PATH}/{playlist_name}'
             print(f"Looking for folder '{output_dir}'")
             if not Path(output_dir).exists():
                 print(f"Folder {output_dir} does not exist, creating...")
