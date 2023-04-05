@@ -11,6 +11,7 @@ from spotdl import Spotdl
 
 BASE_PATH = os.environ.get("BASE_PATH")
 NUM_THREADS = 4
+MAX_DOWNLOAD_RETRIES = 5
 
 class SpotifyClient():
     def __init__(self):
@@ -109,31 +110,36 @@ class SpotdlClient():
         self.spotdl = Spotdl(
             client_id=os.environ.get("SPOTIPY_CLIENT_ID"),
             client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET"),
-            threads=NUM_THREADS,
+            # threads=NUM_THREADS,
         )
     
     def download(self):
         playlists_to_update = self.spotify_client.get_snapshot_diff()
-        try:
-            for playlist_obj in playlists_to_update:
-                playlist_name = playlist_obj.get("name")
-                output_dir = f'{BASE_PATH}/{playlist_name}'
-                print(f"Looking for folder '{output_dir}'")
-                if not Path(output_dir).exists():
-                    print(f"Folder {output_dir} does not exist, creating...")
-                    Path(output_dir).mkdir(exist_ok=True)
-                    print(f"Successfully created folder '{output_dir}'")
-                playlist_url = playlist_obj.get("url")
-                print(f"Searching for playlist '{playlist_name}' ({playlist_url})")
-                songs = self.spotdl.search([
-                    playlist_url,
-                ])
-                print(f"Downloading {len(songs)} songs...")
-                self.spotdl.downloader.output = output_dir
-                results = self.spotdl.download_songs(songs)
-            self.spotify_client.dump_map(self.spotify_client.snapshot_map)
-        except Exception as err:
-            print(err)
+        retries = MAX_DOWNLOAD_RETRIES
+        while retries > 0:
+            try:
+                for playlist_obj in playlists_to_update:
+                    playlist_name = playlist_obj.get("name")
+                    output_dir = f'{BASE_PATH}/{playlist_name}'
+                    print(f"Looking for folder '{output_dir}'")
+                    if not Path(output_dir).exists():
+                        print(f"Folder {output_dir} does not exist, creating...")
+                        Path(output_dir).mkdir(exist_ok=True)
+                        print(f"Successfully created folder '{output_dir}'")
+                    playlist_url = playlist_obj.get("url")
+                    print(f"Searching for playlist '{playlist_name}' ({playlist_url})")
+                    songs = self.spotdl.search([
+                        playlist_url,
+                    ])
+                    print(f"Downloading {len(songs)} songs...")
+                    self.spotdl.downloader.settings["output"] = output_dir
+                    results = self.spotdl.download_songs(songs)
+                self.spotify_client.dump_map(self.spotify_client.snapshot_map)
+                return
+            except Exception as err:
+                print(err)
+                retries -= 1
+            print("Retrying download")
 
 if __name__ == "__main__":
     spotdl_client = SpotdlClient()

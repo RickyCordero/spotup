@@ -5,7 +5,7 @@ name = "pypi"
 
 [packages]
 spotipy = "==2.22.1"
-spotdl = "==4.0.7"
+spotdl = "*"
 
 [dev-packages]
 
