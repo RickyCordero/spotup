@@ -23,7 +23,7 @@ class SpotifyClient():
         )
         self.sp = spotipy.Spotify(auth_manager=self.auth_manager)
         self.playlists = None
-        self.snapshot_map = {}
+        self.target_snapshot_map = {}
 
     def get_playlists(self):
         return self.sp.user_playlists(
@@ -44,9 +44,6 @@ class SpotifyClient():
         else:
             self.playlists = None
     
-    def set_snapshot_map(self):
-        self.snapshot_map = self.build_snapshot_map()
-
     def build_snapshot_map(self):
         snapshot_map = {}
         playlists = self.sp.user_playlists(self.username)
@@ -71,37 +68,56 @@ class SpotifyClient():
         with open("snapshot_map.json", "w") as snapshot_file:
             json.dump(m, snapshot_file, indent=4, sort_keys=True)
 
+    def incremental_dump_map(self, entry):
+        """
+        Parameters
+        -----------
+            entry: tuple(str, dict)
+        """
+        with open("snapshot_map.json", "r") as snapshot_file:
+            if res := snapshot_file.read():
+                data = json.loads(res)
+            else:
+                data = {}
+
+        k, v = entry
+        data[k] = v
+
+        with open("snapshot_map.json", "w") as snapshot_file:
+            json.dump(data, snapshot_file, indent=4, sort_keys=True)
+
     def dump_snapshot_map(self):
-        self.dump_map(self.snapshot_map)
+        self.dump_map(self.build_snapshot_map())
 
     def get_snapshot_diff(self):
         playlists_to_update = []
-        try:
-            prev_map = self.load_snapshot_map()
-        except Exception as err:
-            prev_map = None
-        curr_map = self.build_snapshot_map()
+        prev_map = self.load_snapshot_map()
+        target_snapshot_map = self.build_snapshot_map()
         count = 0
-        if prev_map:
-            for k in curr_map.keys():
-                curr_obj = curr_map.get(k)
-                curr_snapshot_id = curr_obj.get("snapshot_id")
-                prev_obj = prev_map.get(k)
-                if prev_obj:
-                    prev_snapshot_id = prev_obj.get("snapshot_id")
-                    if curr_snapshot_id != prev_snapshot_id:
-                        print(f"Playlist '{k}' was updated. Download again: {curr_obj}")
-                        count += 1
-                        playlists_to_update.append({"name": k, "url": curr_obj.get("url")})
-                else:
-                    print(f"Playlist '{k}' was added/removed")
+        for playlist_name in target_snapshot_map.keys():
+            playlist_obj = target_snapshot_map.get(playlist_name)
+            playlist_snapshot_id = playlist_obj.get("snapshot_id")
+            prev_playlist_obj = prev_map.get(playlist_name)
+            if prev_playlist_obj:
+                prev_playlist_snapshot_id = prev_playlist_obj.get("snapshot_id")
+                if playlist_snapshot_id != prev_playlist_snapshot_id:
+                    print(f"Playlist '{playlist_name}' was updated. Download again: {playlist_obj}")
+                    playlists_to_update.append({"name": playlist_name, "url": playlist_obj.get("url")})
+                    count += 1
+            else:
+                print(f"Playlist '{playlist_name}' was added")
+                playlists_to_update.append({"name": playlist_name, "url": playlist_obj.get("url")})
+                count += 1
         print(f"{count} playlists should be updated.")
-        self.snapshot_map = curr_map
+        self.target_snapshot_map = target_snapshot_map
         return playlists_to_update
 
     def load_snapshot_map(self):
         with open("snapshot_map.json") as snapshot_file:
-            return json.loads(snapshot_file.read())
+            if data := snapshot_file.read():
+                return json.loads(data)
+            else:
+                return {}
 
 class SpotdlClient():
 
@@ -134,7 +150,10 @@ class SpotdlClient():
                     print(f"Downloading {len(songs)} songs...")
                     self.spotdl.downloader.settings["output"] = output_dir
                     results = self.spotdl.download_songs(songs)
-                self.spotify_client.dump_map(self.spotify_client.snapshot_map)
+                    self.spotify_client.incremental_dump_map((
+                        playlist_name,
+                        self.spotify_client.target_snapshot_map.get(playlist_name),
+                    ))
                 return
             except Exception as err:
                 print(err)
