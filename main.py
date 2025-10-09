@@ -3,6 +3,8 @@ from pathlib import (
     Path,
 )
 import json
+import random
+
 import spotipy
 from spotipy.oauth2 import (
     SpotifyOAuth,
@@ -131,6 +133,7 @@ class SpotdlClient():
     
     def download(self):
         playlists_to_update = self.spotify_client.get_snapshot_diff()
+        random.shuffle(playlists_to_update)
         retries = MAX_DOWNLOAD_RETRIES
         while retries > 0:
             try:
