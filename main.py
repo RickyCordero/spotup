@@ -94,10 +94,13 @@ class SpotifyClient():
     def get_snapshot_diff(self):
         playlists_to_update = []
         prev_map = self.load_snapshot_map()
-        target_snapshot_map = self.build_snapshot_map()
+        
+        # Build target_snapshot_map once and store it
+        self.target_snapshot_map = self.build_snapshot_map() 
+        
         count = 0
-        for playlist_name in target_snapshot_map.keys():
-            playlist_obj = target_snapshot_map.get(playlist_name)
+        for playlist_name in self.target_snapshot_map.keys(): # Use self.target_snapshot_map directly
+            playlist_obj = self.target_snapshot_map.get(playlist_name)
             playlist_snapshot_id = playlist_obj.get("snapshot_id")
             prev_playlist_obj = prev_map.get(playlist_name)
             if prev_playlist_obj:
@@ -111,7 +114,6 @@ class SpotifyClient():
                 playlists_to_update.append({"name": playlist_name, "url": playlist_obj.get("url")})
                 count += 1
         print(f"{count} playlists should be updated.")
-        self.target_snapshot_map = target_snapshot_map
         return playlists_to_update
 
     def load_snapshot_map(self):
@@ -128,40 +130,62 @@ class SpotdlClient():
         self.spotdl = Spotdl(
             client_id=os.environ.get("SPOTIPY_CLIENT_ID"),
             client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET"),
-            # threads=NUM_THREADS,
+            downloader_settings={ # <--- Pass threads here as a dictionary value
+                "threads": NUM_THREADS,
+            },
         )
     
     def download(self):
         playlists_to_update = self.spotify_client.get_snapshot_diff()
         random.shuffle(playlists_to_update)
-        retries = MAX_DOWNLOAD_RETRIES
-        while retries > 0:
-            try:
-                for playlist_obj in playlists_to_update:
-                    playlist_name = playlist_obj.get("name")
-                    output_dir = f'{BASE_PATH}/{playlist_name}'
-                    print(f"Looking for folder '{output_dir}'")
-                    if not Path(output_dir).exists():
-                        print(f"Folder {output_dir} does not exist, creating...")
-                        Path(output_dir).mkdir(exist_ok=True)
-                        print(f"Successfully created folder '{output_dir}'")
-                    playlist_url = playlist_obj.get("url")
+        
+        successfully_downloaded_playlists = {} # Store playlists that were successfully downloaded
+        
+        for playlist_obj in playlists_to_update:
+            playlist_name = playlist_obj.get("name")
+            playlist_url = playlist_obj.get("url")
+            output_dir = f'{BASE_PATH}/{playlist_name}'
+            
+            print(f"Looking for folder '{output_dir}'")
+            if not Path(output_dir).exists():
+                print(f"Folder {output_dir} does not exist, creating...")
+                Path(output_dir).mkdir(exist_ok=True)
+                print(f"Successfully created folder '{output_dir}'")
+
+            # Attempt to download with retries for *this specific playlist*
+            retries = MAX_DOWNLOAD_RETRIES
+            while retries > 0:
+                try:
                     print(f"Searching for playlist '{playlist_name}' ({playlist_url})")
-                    songs = self.spotdl.search([
-                        playlist_url,
-                    ])
-                    print(f"Downloading {len(songs)} songs...")
+                    songs = self.spotdl.search([playlist_url])
+                    print(f"Downloading {len(songs)} songs from '{playlist_name}'...")
                     self.spotdl.downloader.settings["output"] = output_dir
+                    
+                    # This is where the actual download happens, spotdl uses its own threads here
                     results = self.spotdl.download_songs(songs)
-                    self.spotify_client.incremental_dump_map((
-                        playlist_name,
-                        self.spotify_client.target_snapshot_map.get(playlist_name),
-                    ))
-                return
-            except Exception as err:
-                print(err)
-                retries -= 1
-            print("Retrying download")
+                    
+                    # If successful, mark it as downloaded and break retry loop
+                    print(f"Successfully downloaded playlist '{playlist_name}'.")
+                    successfully_downloaded_playlists[playlist_name] = \
+                        self.spotify_client.target_snapshot_map.get(playlist_name)
+                    break 
+                except Exception as err:
+                    print(f"Error downloading playlist '{playlist_name}': {err}")
+                    retries -= 1
+                    if retries > 0:
+                        print(f"Retrying download for '{playlist_name}' ({retries} retries left)")
+                    else:
+                        print(f"Failed to download playlist '{playlist_name}' after multiple retries.")
+        
+        # After processing all playlists, dump the updated snapshot map once
+        if successfully_downloaded_playlists:
+            # Load current map, update with successfully downloaded ones, then dump
+            current_snapshot_map = self.spotify_client.load_snapshot_map()
+            current_snapshot_map.update(successfully_downloaded_playlists)
+            self.spotify_client.dump_map(current_snapshot_map)
+            print("Updated snapshot map with successfully downloaded playlists.")
+        else:
+            print("No playlists were successfully downloaded to update the snapshot map.")
 
 if __name__ == "__main__":
     spotdl_client = SpotdlClient()
