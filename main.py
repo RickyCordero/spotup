@@ -1,192 +1,166 @@
 import os
-from pathlib import (
-    Path,
-)
 import json
 import random
+import time
+import tempfile
+import sys
+import logging
+from pathlib import Path
 
 import spotipy
-from spotipy.oauth2 import (
-    SpotifyOAuth,
-)
+from spotipy.oauth2 import SpotifyOAuth
 from spotdl import Spotdl
 
-BASE_PATH = os.environ.get("BASE_PATH")
-NUM_THREADS = 4
-MAX_DOWNLOAD_RETRIES = 5
+# --- 1. ELEGANT LOGGING CONFIGURATION ---
+# This captures all logs (including libraries) and forces them into our format
+log_format = '%(asctime)s | %(levelname)s | %(name)s | %(message)s'
+logging.basicConfig(
+    level=logging.INFO,
+    format=log_format,
+    datefmt='%H:%M:%S',
+    stream=sys.stdout
+)
+
+# --- 2. SETTINGS ---
+BASE_PATH = os.environ.get("BASE_PATH", ".")
+NUM_THREADS = 2         
+MAX_RETRIES = 5
+MAP_FILE = "snapshot_map.json"
 
 class SpotifyClient():
     def __init__(self):
         self.username = os.environ.get("USERNAME")
-        self.scope = "playlist-read-private"
-        self.auth_manager = SpotifyOAuth(
-            scope=self.scope,
-            open_browser=False,
+        self.auth_manager = SpotifyOAuth(scope="playlist-read-private", open_browser=False)
+        self.sp = spotipy.Spotify(
+            auth_manager=self.auth_manager,
+            requests_timeout=60,
+            retries=15,
+            backoff_factor=1.5
         )
-        self.sp = spotipy.Spotify(auth_manager=self.auth_manager)
-        self.playlists = None
         self.target_snapshot_map = {}
+        self._cached_map = None
 
-    def get_playlists(self):
-        return self.sp.user_playlists(
-            self.username,
-            limit=50, # max is 50 records per page
-        )
+    def check_initial_rate_limit(self):
+        """Checks if the account is currently banned/limited before starting."""
+        try:
+            self.sp.me()
+            return True
+        except Exception as e:
+            if "429" in str(e):
+                logging.error("⛔ CRITICAL: You are currently rate-limited by Spotify (likely the 14-hour ban).")
+                return False
+            logging.error(f"⚠️ Connection Error: {e}")
+            return False
 
-    def set_playlists(self):
-        self.playlists = self.get_playlists()
+    def load_map(self):
+        if self._cached_map is not None: return self._cached_map
+        if not Path(MAP_FILE).exists(): return {}
+        try:
+            with open(MAP_FILE, "r") as f:
+                self._cached_map = json.load(f)
+                return self._cached_map
+        except: return {}
 
-    def view_playlists(self):
-        self.set_playlists()
-        while self.playlists:
-            for i, playlist in enumerate(self.playlists['items']):
-                print("%4d %s %s" % (i + 1 + self.playlists['offset'], playlist['uri'],  playlist['name']))
-        if self.playlists['next']:
-            self.playlists = self.sp.next(self.playlists)
-        else:
-            self.playlists = None
-    
-    def build_snapshot_map(self):
-        snapshot_map = {}
-        playlists = self.sp.user_playlists(self.username)
-        while playlists is not None:
-            for playlist_obj in playlists.get("items"):
-                owner_id = playlist_obj.get("owner").get("id")
-                if owner_id == self.username:
-                    snapshot_id = playlist_obj.get("snapshot_id")
-                    name = playlist_obj.get("name")
-                    url = playlist_obj.get("external_urls").get("spotify")
-                    snapshot_map[name] = {
-                        "url": url,
-                        "snapshot_id": snapshot_id,
+    def atomic_save(self, name, entry):
+        data = self.load_map()
+        data[name] = entry
+        self._cached_map = data
+        fd, temp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(MAP_FILE)))
+        try:
+            with os.fdopen(fd, 'w') as tmp:
+                json.dump(data, tmp, indent=4, sort_keys=True)
+            os.replace(temp, MAP_FILE)
+        except:
+            if os.path.exists(temp): os.remove(temp)
+
+    def get_all_playlists(self):
+        full_map = {}
+        results = self.sp.current_user_playlists(limit=50)
+        while results:
+            for item in results['items']:
+                if item and item['owner']['id'] == self.username:
+                    full_map[item['name']] = {
+                        "url": item['external_urls']['spotify'],
+                        "snapshot_id": item['snapshot_id'],
+                        "track_count": item['tracks']['total']
                     }
-            if playlists['next']:
-                playlists = self.sp.next(playlists)
-            else:
-                playlists = None
-        return snapshot_map
-
-    def dump_map(self, m):
-        with open("snapshot_map.json", "w") as snapshot_file:
-            json.dump(m, snapshot_file, indent=4, sort_keys=True)
-
-    def incremental_dump_map(self, entry):
-        """
-        Parameters
-        -----------
-            entry: tuple(str, dict)
-        """
-        with open("snapshot_map.json", "r") as snapshot_file:
-            if res := snapshot_file.read():
-                data = json.loads(res)
-            else:
-                data = {}
-
-        k, v = entry
-        data[k] = v
-
-        with open("snapshot_map.json", "w") as snapshot_file:
-            json.dump(data, snapshot_file, indent=4, sort_keys=True)
-
-    def dump_snapshot_map(self):
-        self.dump_map(self.build_snapshot_map())
-
-    def get_snapshot_diff(self):
-        playlists_to_update = []
-        prev_map = self.load_snapshot_map()
-        
-        # Build target_snapshot_map once and store it
-        self.target_snapshot_map = self.build_snapshot_map() 
-        
-        count = 0
-        for playlist_name in self.target_snapshot_map.keys(): # Use self.target_snapshot_map directly
-            playlist_obj = self.target_snapshot_map.get(playlist_name)
-            playlist_snapshot_id = playlist_obj.get("snapshot_id")
-            prev_playlist_obj = prev_map.get(playlist_name)
-            if prev_playlist_obj:
-                prev_playlist_snapshot_id = prev_playlist_obj.get("snapshot_id")
-                if playlist_snapshot_id != prev_playlist_snapshot_id:
-                    print(f"Playlist '{playlist_name}' was updated. Download again: {playlist_obj}")
-                    playlists_to_update.append({"name": playlist_name, "url": playlist_obj.get("url")})
-                    count += 1
-            else:
-                print(f"Playlist '{playlist_name}' was added")
-                playlists_to_update.append({"name": playlist_name, "url": playlist_obj.get("url")})
-                count += 1
-        print(f"{count} playlists should be updated.")
-        return playlists_to_update
-
-    def load_snapshot_map(self):
-        with open("snapshot_map.json") as snapshot_file:
-            if data := snapshot_file.read():
-                return json.loads(data)
-            else:
-                return {}
+            results = self.sp.next(results) if results['next'] else None
+        return full_map
 
 class SpotdlClient():
-
     def __init__(self):
         self.spotify_client = SpotifyClient()
         self.spotdl = Spotdl(
             client_id=os.environ.get("SPOTIPY_CLIENT_ID"),
             client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET"),
-            downloader_settings={ # <--- Pass threads here as a dictionary value
-                "threads": NUM_THREADS,
+            downloader_settings={
+                "threads": NUM_THREADS, 
+                "silent": False,      
+                "fetch_albums": False 
             },
         )
-    
-    def download(self):
-        playlists_to_update = self.spotify_client.get_snapshot_diff()
-        random.shuffle(playlists_to_update)
-        
-        successfully_downloaded_playlists = {} # Store playlists that were successfully downloaded
-        
-        for playlist_obj in playlists_to_update:
-            playlist_name = playlist_obj.get("name")
-            playlist_url = playlist_obj.get("url")
-            output_dir = f'{BASE_PATH}/{playlist_name}'
-            
-            print(f"Looking for folder '{output_dir}'")
-            if not Path(output_dir).exists():
-                print(f"Folder {output_dir} does not exist, creating...")
-                Path(output_dir).mkdir(exist_ok=True)
-                print(f"Successfully created folder '{output_dir}'")
 
-            # Attempt to download with retries for *this specific playlist*
-            retries = MAX_DOWNLOAD_RETRIES
-            while retries > 0:
-                try:
-                    print(f"Searching for playlist '{playlist_name}' ({playlist_url})")
-                    songs = self.spotdl.search([playlist_url])
-                    print(f"Downloading {len(songs)} songs from '{playlist_name}'...")
-                    self.spotdl.downloader.settings["output"] = output_dir
-                    
-                    # This is where the actual download happens, spotdl uses its own threads here
-                    results = self.spotdl.download_songs(songs)
-                    
-                    # If successful, mark it as downloaded and break retry loop
-                    print(f"Successfully downloaded playlist '{playlist_name}'.")
-                    successfully_downloaded_playlists[playlist_name] = \
-                        self.spotify_client.target_snapshot_map.get(playlist_name)
-                    break 
-                except Exception as err:
-                    print(f"Error downloading playlist '{playlist_name}': {err}")
-                    retries -= 1
-                    if retries > 0:
-                        print(f"Retrying download for '{playlist_name}' ({retries} retries left)")
-                    else:
-                        print(f"Failed to download playlist '{playlist_name}' after multiple retries.")
+    def visual_countdown(self, seconds, reason="Cooldown"):
+        for i in range(int(seconds), 0, -1):
+            sys.stdout.write(f"\r⏳ {reason}: {i}s remaining...   ")
+            sys.stdout.flush()
+            time.sleep(1)
+        sys.stdout.write("\r" + " " * 80 + "\r") 
+
+    def download(self):
+        if not os.path.exists(BASE_PATH):
+            logging.error(f"WSL Mount Error: {BASE_PATH} is inaccessible.")
+            return
+
+        # --- PRE-FLIGHT CHECK ---
+        if not self.spotify_client.check_initial_rate_limit():
+            return
+
+        logging.info("Starting Spotify Sync (Mega-Playlist Optimized)")
+        self.spotify_client.target_snapshot_map = self.spotify_client.get_all_playlists()
+        local_map = self.spotify_client.load_map()
         
-        # After processing all playlists, dump the updated snapshot map once
-        if successfully_downloaded_playlists:
-            # Load current map, update with successfully downloaded ones, then dump
-            current_snapshot_map = self.spotify_client.load_snapshot_map()
-            current_snapshot_map.update(successfully_downloaded_playlists)
-            self.spotify_client.dump_map(current_snapshot_map)
-            print("Updated snapshot map with successfully downloaded playlists.")
-        else:
-            print("No playlists were successfully downloaded to update the snapshot map.")
+        queue = [
+            {"name": n, "url": obj["url"], "count": obj["track_count"]} 
+            for n, obj in self.spotify_client.target_snapshot_map.items()
+            if n not in local_map or local_map[n]["snapshot_id"] != obj["snapshot_id"]
+        ]
+        
+        random.shuffle(queue)
+        logging.info(f"Queue: {len(queue)} playlists pending.")
+
+        for item in queue:
+            name, url, count = item["name"], item["url"], item["count"]
+            path = Path(BASE_PATH) / name
+            path.mkdir(parents=True, exist_ok=True)
+
+            dynamic_delay = 10 + (count // 40)
+            self.visual_countdown(random.uniform(5, dynamic_delay), f"Pre-sync: {name}")
+
+            for attempt in range(MAX_RETRIES):
+                try:
+                    logging.info(f"SEARCHING: {name} ({count} tracks)")
+                    songs = self.spotdl.search([url])
+                    
+                    self.spotdl.downloader.settings["output"] = str(path)
+                    self.spotdl.download_songs(songs)
+                    
+                    entry = self.spotify_client.target_snapshot_map.get(name)
+                    self.spotify_client.atomic_save(name, entry)
+                    logging.info(f"SUCCESS: {name} saved to disk.")
+                    
+                    if count > 400:
+                        self.visual_countdown(60, "Mega-Playlist Buffer Recovery")
+                    break 
+
+                except Exception as e:
+                    if "429" in str(e):
+                        wait_time = 180 * (attempt + 1) # 3-minute backoff for 429s
+                        logging.warning(f"RATE LIMIT: {name}. Applying heavy backoff.")
+                        self.visual_countdown(wait_time, "API Cooldown")
+                    else:
+                        logging.error(f"SKIPPED: {name} due to {e}")
+                        break
 
 if __name__ == "__main__":
-    spotdl_client = SpotdlClient()
-    spotdl_client.download()
+    SpotdlClient().download()
