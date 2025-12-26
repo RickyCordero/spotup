@@ -12,7 +12,6 @@ from spotipy.oauth2 import SpotifyOAuth
 from spotdl import Spotdl
 
 # --- 1. ELEGANT LOGGING CONFIGURATION ---
-# This captures all logs (including libraries) and forces them into our format
 log_format = '%(asctime)s | %(levelname)s | %(name)s | %(message)s'
 logging.basicConfig(
     level=logging.INFO,
@@ -21,9 +20,14 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
+# Silence internal noise to keep the terminal clean
+logging.getLogger("spotipy").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+logging.getLogger("spotdl").setLevel(logging.CRITICAL)
+
 # --- 2. SETTINGS ---
 BASE_PATH = os.environ.get("BASE_PATH", ".")
-NUM_THREADS = 2         
+NUM_THREADS = 1         # Stick to 1 for now to recover from the 83k ban
 MAX_RETRIES = 5
 MAP_FILE = "snapshot_map.json"
 
@@ -35,22 +39,20 @@ class SpotifyClient():
             auth_manager=self.auth_manager,
             requests_timeout=60,
             retries=15,
-            backoff_factor=1.5
+            backoff_factor=2.0
         )
         self.target_snapshot_map = {}
         self._cached_map = None
 
     def check_initial_rate_limit(self):
-        """Checks if the account is currently banned/limited before starting."""
+        """Verifies if the 23-hour ban is still active."""
         try:
             self.sp.me()
             return True
         except Exception as e:
             if "429" in str(e):
-                logging.error("⛔ CRITICAL: You are currently rate-limited by Spotify (likely the 14-hour ban).")
                 return False
-            logging.error(f"⚠️ Connection Error: {e}")
-            return False
+            return True # Other errors will be caught later
 
     def load_map(self):
         if self._cached_map is not None: return self._cached_map
@@ -105,18 +107,49 @@ class SpotdlClient():
             sys.stdout.write(f"\r⏳ {reason}: {i}s remaining...   ")
             sys.stdout.flush()
             time.sleep(1)
-        sys.stdout.write("\r" + " " * 80 + "\r") 
+        sys.stdout.write("\r" + " " * 85 + "\r") 
+
+    def process_playlist(self, item):
+        name, url, count = item["name"], item["url"], item["count"]
+        path = Path(BASE_PATH) / name
+        path.mkdir(parents=True, exist_ok=True)
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                logging.info(f"🚀 Processing: {name} ({count} tracks)")
+                songs = self.spotdl.search([url])
+                self.spotdl.downloader.settings["output"] = str(path)
+                self.spotdl.download_songs(songs)
+                
+                entry = self.spotify_client.target_snapshot_map.get(name)
+                self.spotify_client.atomic_save(name, entry)
+                logging.info(f"✅ SUCCESS: {name}")
+                return True
+
+            except Exception as e:
+                err_msg = str(e)
+                if "429" in err_msg:
+                    if "83000" in err_msg or "50000" in err_msg:
+                        logging.error(f"⛔ HARD BAN DETECTED ({err_msg}). Please wait 24 hours.")
+                        sys.exit(1)
+                    
+                    wait_time = 180 * (attempt + 1)
+                    logging.warning(f"⚠️ Rate Limit on {name}. Backing off.")
+                    self.visual_countdown(wait_time, "API Backoff")
+                else:
+                    logging.error(f"❌ Error on {name}: {e}")
+                    return False
 
     def download(self):
         if not os.path.exists(BASE_PATH):
             logging.error(f"WSL Mount Error: {BASE_PATH} is inaccessible.")
             return
 
-        # --- PRE-FLIGHT CHECK ---
         if not self.spotify_client.check_initial_rate_limit():
+            logging.critical("⛔ ACCOUNT LOCKED: The 24-hour Spotify ban is still active.")
             return
 
-        logging.info("Starting Spotify Sync (Mega-Playlist Optimized)")
+        logging.info("Fetching library data...")
         self.spotify_client.target_snapshot_map = self.spotify_client.get_all_playlists()
         local_map = self.spotify_client.load_map()
         
@@ -125,42 +158,38 @@ class SpotdlClient():
             for n, obj in self.spotify_client.target_snapshot_map.items()
             if n not in local_map or local_map[n]["snapshot_id"] != obj["snapshot_id"]
         ]
+
+        if not queue:
+            logging.info("Everything is already up to date!")
+            return
+
+        # --- INTERACTIVE MENU ---
+        print("\n" + "="*45)
+        print("      SPOTIFY PLAYLIST DOWNLOADER")
+        print("="*45)
+        print("  0. [PROCESS ALL PENDING PLAYLISTS]")
+        for i, item in enumerate(queue, 1):
+            print(f"  {i:2}. {item['name']:30} ({item['count']:4} tracks)")
+        print("="*45)
         
-        random.shuffle(queue)
-        logging.info(f"Queue: {len(queue)} playlists pending.")
+        try:
+            choice = int(input(f"\nSelect an option (0-{len(queue)}): "))
+        except ValueError:
+            print("Invalid input. Exiting.")
+            return
 
-        for item in queue:
-            name, url, count = item["name"], item["url"], item["count"]
-            path = Path(BASE_PATH) / name
-            path.mkdir(parents=True, exist_ok=True)
-
-            dynamic_delay = 10 + (count // 40)
-            self.visual_countdown(random.uniform(5, dynamic_delay), f"Pre-sync: {name}")
-
-            for attempt in range(MAX_RETRIES):
-                try:
-                    logging.info(f"SEARCHING: {name} ({count} tracks)")
-                    songs = self.spotdl.search([url])
-                    
-                    self.spotdl.downloader.settings["output"] = str(path)
-                    self.spotdl.download_songs(songs)
-                    
-                    entry = self.spotify_client.target_snapshot_map.get(name)
-                    self.spotify_client.atomic_save(name, entry)
-                    logging.info(f"SUCCESS: {name} saved to disk.")
-                    
-                    if count > 400:
-                        self.visual_countdown(60, "Mega-Playlist Buffer Recovery")
-                    break 
-
-                except Exception as e:
-                    if "429" in str(e):
-                        wait_time = 180 * (attempt + 1) # 3-minute backoff for 429s
-                        logging.warning(f"RATE LIMIT: {name}. Applying heavy backoff.")
-                        self.visual_countdown(wait_time, "API Cooldown")
-                    else:
-                        logging.error(f"SKIPPED: {name} due to {e}")
-                        break
+        if choice == 0:
+            random.shuffle(queue)
+            logging.info(f"Starting batch process for {len(queue)} playlists...")
+            for item in queue:
+                dynamic_delay = 10 + (item['count'] // 40)
+                self.visual_countdown(random.uniform(5, dynamic_delay), f"Staggering: {item['name']}")
+                self.process_playlist(item)
+                if item['count'] > 300: self.visual_countdown(45, "Post-Mega Cooling")
+        elif 1 <= choice <= len(queue):
+            self.process_playlist(queue[choice - 1])
+        else:
+            print("Choice out of range.")
 
 if __name__ == "__main__":
     SpotdlClient().download()
