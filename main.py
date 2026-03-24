@@ -2,78 +2,55 @@ import os
 import json
 import random
 import time
-import tempfile
 import sys
 import logging
+import shutil
 from pathlib import Path
 
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from spotdl import Spotdl
 
-# --- 1. ELEGANT LOGGING CONFIGURATION ---
-log_format = '%(asctime)s | %(levelname)s | %(name)s | %(message)s'
-logging.basicConfig(
-    level=logging.INFO,
-    format=log_format,
-    datefmt='%H:%M:%S',
-    stream=sys.stdout
-)
-
-# Silence internal noise to keep the terminal clean
+# --- 1. LOGGING & SAFETY GATE ---
+log_format = '%(asctime)s | %(levelname)s | %(message)s'
+logging.basicConfig(level=logging.INFO, format=log_format, datefmt='%H:%M:%S', stream=sys.stdout)
 logging.getLogger("spotipy").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
-logging.getLogger("spotdl").setLevel(logging.CRITICAL)
+logging.getLogger("spotdl").setLevel(logging.INFO) 
 
-# --- 2. SETTINGS ---
-BASE_PATH = os.environ.get("BASE_PATH", ".")
-NUM_THREADS = 1         # Stick to 1 for now to recover from the 83k ban
-MAX_RETRIES = 5
+if not shutil.which("ffmpeg"):
+    print("\n" + "!"*60)
+    print("❌ CRITICAL ERROR: FFmpeg is missing from your system PATH.")
+    print("SpotDL needs it to tag the audio files. Run this in your terminal:")
+    print("sudo apt update && sudo apt install ffmpeg")
+    print("!"*60 + "\n")
+    sys.exit(1)
+
+env_base = os.environ.get("BASE_PATH")
+if not env_base or env_base == ".":
+    print("\n" + "!"*60)
+    print("❌ PATH ERROR: $BASE_PATH is not set.")
+    print("FIX: export BASE_PATH='/mnt/e/Music'")
+    print("!"*60 + "\n")
+    sys.exit(1)
+
+BASE_PATH = Path(env_base).resolve()
 MAP_FILE = "snapshot_map.json"
+NUM_THREADS = 1
 
-class SpotifyClient():
+class SpotifyClient:
     def __init__(self):
         self.username = os.environ.get("USERNAME")
         self.auth_manager = SpotifyOAuth(scope="playlist-read-private", open_browser=False)
-        self.sp = spotipy.Spotify(
-            auth_manager=self.auth_manager,
-            requests_timeout=60,
-            retries=15,
-            backoff_factor=2.0
-        )
+        self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_timeout=60)
         self.target_snapshot_map = {}
-        self._cached_map = None
 
     def check_initial_rate_limit(self):
-        """Verifies if the 23-hour ban is still active."""
         try:
             self.sp.me()
             return True
-        except Exception as e:
-            if "429" in str(e):
-                return False
-            return True # Other errors will be caught later
-
-    def load_map(self):
-        if self._cached_map is not None: return self._cached_map
-        if not Path(MAP_FILE).exists(): return {}
-        try:
-            with open(MAP_FILE, "r") as f:
-                self._cached_map = json.load(f)
-                return self._cached_map
-        except: return {}
-
-    def atomic_save(self, name, entry):
-        data = self.load_map()
-        data[name] = entry
-        self._cached_map = data
-        fd, temp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(MAP_FILE)))
-        try:
-            with os.fdopen(fd, 'w') as tmp:
-                json.dump(data, tmp, indent=4, sort_keys=True)
-            os.replace(temp, MAP_FILE)
-        except:
-            if os.path.exists(temp): os.remove(temp)
+        except Exception:
+            return False
 
     def get_all_playlists(self):
         full_map = {}
@@ -89,107 +66,122 @@ class SpotifyClient():
             results = self.sp.next(results) if results['next'] else None
         return full_map
 
-class SpotdlClient():
-    def __init__(self):
-        self.spotify_client = SpotifyClient()
-        self.spotdl = Spotdl(
-            client_id=os.environ.get("SPOTIPY_CLIENT_ID"),
-            client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET"),
-            downloader_settings={
-                "threads": NUM_THREADS, 
-                "silent": False,      
-                "fetch_albums": False 
-            },
-        )
+class SpotdlSync:
+    def __init__(self, audio_format="m4a", bitrate="disable"):
+        self.spotify = SpotifyClient()
+        self.client_id = os.environ.get("SPOTIPY_CLIENT_ID")
+        self.client_secret = os.environ.get("SPOTIPY_CLIENT_SECRET")
+        self.audio_format = audio_format
+        self.bitrate = bitrate
 
     def visual_countdown(self, seconds, reason="Cooldown"):
         for i in range(int(seconds), 0, -1):
             sys.stdout.write(f"\r⏳ {reason}: {i}s remaining...   ")
             sys.stdout.flush()
             time.sleep(1)
-        sys.stdout.write("\r" + " " * 85 + "\r") 
+        sys.stdout.write("\r" + " " * 85 + "\r")
 
-    def process_playlist(self, item):
-        name, url, count = item["name"], item["url"], item["count"]
-        path = Path(BASE_PATH) / name
-        path.mkdir(parents=True, exist_ok=True)
+    def run(self):
+        temp_path = Path.home() / ".spotdl" / "temp"
+        if temp_path.exists():
+            shutil.rmtree(temp_path, ignore_errors=True)
+        temp_path.mkdir(parents=True, exist_ok=True)
 
-        for attempt in range(MAX_RETRIES):
+        print("\n" + "="*60)
+        print(f"📂 DESTINATION: {BASE_PATH}")
+        print(f"🎵 FORMAT:      {self.audio_format.upper()} ({self.bitrate if self.bitrate != 'disable' else 'Native'})")
+        print("⚙️  THREADS:     1 (Strict Anti-Rate Limit Mode)")
+        print("="*60)
+
+        if not self.spotify.check_initial_rate_limit():
+            logging.critical("⛔ 24-hour Spotify ban active.")
+            return
+
+        logging.info("Scanning Spotify library...")
+        self.spotify.target_snapshot_map = self.spotify.get_all_playlists()
+        
+        local_map = {}
+        if Path(MAP_FILE).exists():
+            with open(MAP_FILE, 'r') as f: 
+                local_map = json.load(f)
+
+        all_names = sorted(self.spotify.target_snapshot_map.keys())
+        
+        print("\n" + "="*60)
+        print("      SPOTIFY PLAYLIST MENU")
+        print("="*60)
+        print("  0. [SYNC ALL PENDING]")
+        print("  F. [FORCE UPDATE ALL]")
+        for i, name in enumerate(all_names, 1):
+            target = self.spotify.target_snapshot_map[name]
+            is_up = name in local_map and local_map[name]['snapshot_id'] == target['snapshot_id']
+            print(f"  {i:2}. {'[UP TO DATE]' if is_up else '[PENDING]'} {name[:25]}")
+        
+        choice = input(f"\nSelect 0, F, or 1-{len(all_names)}: ").strip().lower()
+
+        queue = []
+        if choice == '0':
+            queue = [n for n in all_names if n not in local_map or local_map[n]['snapshot_id'] != self.spotify.target_snapshot_map[n]['snapshot_id']]
+        elif choice == 'f':
+            queue = all_names
+        elif choice.isdigit() and 1 <= int(choice) <= len(all_names):
+            name = all_names[int(choice)-1]
+            queue = [name]
+
+        original_cwd = os.getcwd()
+
+        for name in queue:
+            item = self.spotify.target_snapshot_map[name]
+            playlist_dir = BASE_PATH / name
+            playlist_dir.mkdir(parents=True, exist_ok=True)
+            
+            if len(queue) > 1:
+                self.visual_countdown(random.uniform(8, 15), f"Staggering Playlist: {name}")
+            
+            logging.info(f"\n🚀 Syncing: {name}")
+            logging.info(f"📂 Path: {playlist_dir}")
+
             try:
-                logging.info(f"🚀 Processing: {name} ({count} tracks)")
-                songs = self.spotdl.search([url])
-                self.spotdl.downloader.settings["output"] = str(path)
-                self.spotdl.download_songs(songs)
+                os.chdir(playlist_dir)
+
+                spotdl_instance = Spotdl(
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    downloader_settings={
+                        "threads": NUM_THREADS,
+                        "format": self.audio_format,
+                        "bitrate": self.bitrate, 
+                        "output": "{artists} - {title}"
+                    }
+                )
                 
-                entry = self.spotify_client.target_snapshot_map.get(name)
-                self.spotify_client.atomic_save(name, entry)
-                logging.info(f"✅ SUCCESS: {name}")
-                return True
+                songs = spotdl_instance.search([item['url']])
+                spotdl_instance.download_songs(songs)
+                
+                downloaded_files = list(Path(".").glob(f"*.{self.audio_format}"))
+                if len(downloaded_files) > 0:
+                    local_map[name] = item
+                    with open(Path(original_cwd) / MAP_FILE, 'w') as f: 
+                        json.dump(local_map, f, indent=4, sort_keys=True)
+                    logging.info(f"✅ SUCCESS: {name} ({len(downloaded_files)} files total)\n")
+                else:
+                    logging.warning(f"⚠️ {name} completed but 0 files were saved. Snapshot not updated.\n")
 
             except Exception as e:
-                err_msg = str(e)
-                if "429" in err_msg:
-                    if "83000" in err_msg or "50000" in err_msg:
-                        logging.error(f"⛔ HARD BAN DETECTED ({err_msg}). Please wait 24 hours.")
-                        sys.exit(1)
-                    
-                    wait_time = 180 * (attempt + 1)
-                    logging.warning(f"⚠️ Rate Limit on {name}. Backing off.")
-                    self.visual_countdown(wait_time, "API Backoff")
-                else:
-                    logging.error(f"❌ Error on {name}: {e}")
-                    return False
-
-    def download(self):
-        if not os.path.exists(BASE_PATH):
-            logging.error(f"WSL Mount Error: {BASE_PATH} is inaccessible.")
-            return
-
-        if not self.spotify_client.check_initial_rate_limit():
-            logging.critical("⛔ ACCOUNT LOCKED: The 24-hour Spotify ban is still active.")
-            return
-
-        logging.info("Fetching library data...")
-        self.spotify_client.target_snapshot_map = self.spotify_client.get_all_playlists()
-        local_map = self.spotify_client.load_map()
-        
-        queue = [
-            {"name": n, "url": obj["url"], "count": obj["track_count"]} 
-            for n, obj in self.spotify_client.target_snapshot_map.items()
-            if n not in local_map or local_map[n]["snapshot_id"] != obj["snapshot_id"]
-        ]
-
-        if not queue:
-            logging.info("Everything is already up to date!")
-            return
-
-        # --- INTERACTIVE MENU ---
-        print("\n" + "="*45)
-        print("      SPOTIFY PLAYLIST DOWNLOADER")
-        print("="*45)
-        print("  0. [PROCESS ALL PENDING PLAYLISTS]")
-        for i, item in enumerate(queue, 1):
-            print(f"  {i:2}. {item['name']:30} ({item['count']:4} tracks)")
-        print("="*45)
-        
-        try:
-            choice = int(input(f"\nSelect an option (0-{len(queue)}): "))
-        except ValueError:
-            print("Invalid input. Exiting.")
-            return
-
-        if choice == 0:
-            random.shuffle(queue)
-            logging.info(f"Starting batch process for {len(queue)} playlists...")
-            for item in queue:
-                dynamic_delay = 10 + (item['count'] // 40)
-                self.visual_countdown(random.uniform(5, dynamic_delay), f"Staggering: {item['name']}")
-                self.process_playlist(item)
-                if item['count'] > 300: self.visual_countdown(45, "Post-Mega Cooling")
-        elif 1 <= choice <= len(queue):
-            self.process_playlist(queue[choice - 1])
-        else:
-            print("Choice out of range.")
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    logging.error("⛔ YOUTUBE RATE LIMIT BAN. Stopping script to prevent deeper ban.")
+                    sys.exit(1)
+                logging.error(f"❌ Error syncing {name}: {e}")
+            finally:
+                os.chdir(original_cwd)
 
 if __name__ == "__main__":
-    SpotdlClient().download()
+    print("\n--- FORMAT SELECTION ---")
+    print("1. M4A (Native YouTube AAC - Zero Bloat)")
+    print("2. MP3 (128kbps - Size-Optimized MP3)")
+    fmt_input = input("Choice (1-2) [Default 1]: ").strip()
+    
+    selected_fmt = "mp3" if fmt_input == "2" else "m4a"
+    selected_bitrate = "128k" if selected_fmt == "mp3" else "disable"
+
+    SpotdlSync(audio_format=selected_fmt, bitrate=selected_bitrate).run()
