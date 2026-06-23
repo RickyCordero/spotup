@@ -25,5 +25,5 @@ Use this skill when the user requests to sync, download, or configure playlists 
 4. **Run Synchronization**:
    Recommend running the sync tool:
    ```bash
-   pipenv run python main.py
+   uv run python main.py
    ```
