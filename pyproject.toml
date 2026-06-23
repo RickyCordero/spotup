@@ -1,0 +1,9 @@
+[project]
+name = "spotup"
+version = "0.1.0"
+description = "Sync Spotify playlists to local storage"
+requires-python = ">=3.13"
+dependencies = [
+    "spotdl",
+    "spotipy",
+]
