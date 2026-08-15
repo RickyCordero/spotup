@@ -11,7 +11,13 @@ from pathlib import Path
 
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+from spotipy.exceptions import SpotifyOauthError, SpotifyException
 from spotdl import Spotdl
+from tinytag import TinyTag
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 # --- 1. LOGGING & SAFETY GATE ---
 log_format = '%(asctime)s | %(levelname)s | %(message)s'
@@ -19,26 +25,40 @@ logging.basicConfig(level=logging.INFO, format=log_format, datefmt='%H:%M:%S', s
 logging.getLogger("spotipy").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 logging.getLogger("spotdl").setLevel(logging.INFO) 
+# Check local spotdl configuration directories for ffmpeg first
+local_ffmpeg_paths = [
+    Path.home() / ".config" / "spotdl",
+    Path.home() / ".spotdl",
+]
+for p in local_ffmpeg_paths:
+    ffmpeg_bin = p / "ffmpeg"
+    if ffmpeg_bin.is_file() and os.access(ffmpeg_bin, os.X_OK):
+        os.environ["PATH"] = str(p) + os.path.pathsep + os.environ.get("PATH", "")
+        break
 
 if not shutil.which("ffmpeg"):
     print("\n" + "!"*60)
     print("❌ CRITICAL ERROR: FFmpeg is missing from your system PATH.")
     print("SpotDL needs it to tag the audio files. Run this in your terminal:")
     print("sudo apt update && sudo apt install ffmpeg")
+    print("or run:")
+    print("uv run spotdl --download-ffmpeg")
     print("!"*60 + "\n")
     sys.exit(1)
 
-env_base = os.environ.get("BASE_PATH")
-if not env_base or env_base == ".":
+required_envs = ["BASE_PATH", "SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "USERNAME"]
+missing_envs = [var for var in required_envs if not os.environ.get(var) or os.environ.get(var) == "."]
+if missing_envs:
     print("\n" + "!"*60)
-    print("❌ PATH ERROR: $BASE_PATH is not set.")
-    print("FIX: export BASE_PATH='/mnt/e/Music'")
+    print(f"❌ CONFIG ERROR: Missing environment variable(s): {', '.join(missing_envs)}")
+    print("FIX: Ensure these variables are set in your environment or .env file.")
     print("!"*60 + "\n")
     sys.exit(1)
 
-BASE_PATH = Path(env_base).resolve()
+BASE_PATH = Path(os.environ.get("BASE_PATH")).resolve()
 MAP_FILE = Path(__file__).resolve().parent / "snapshot_map.json"
 NUM_THREADS = 1
+
 
 def sanitize_filename(name):
     """
@@ -59,7 +79,28 @@ class SpotifyClient:
         try:
             self.sp.me()
             return True
-        except Exception:
+        except SpotifyOauthError as e:
+            logging.warning("🔑 Spotify authorization token in '.cache' is invalid or revoked.")
+            cache_path = Path(".cache")
+            if cache_path.exists():
+                logging.info("Removing stale .cache file for re-authentication...")
+                cache_path.unlink(missing_ok=True)
+            self.auth_manager = SpotifyOAuth(scope="playlist-read-private", open_browser=False)
+            self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_timeout=60)
+            try:
+                self.sp.me()
+                return True
+            except Exception as retry_e:
+                logging.error(f"❌ Spotify authentication failed: {retry_e}")
+                return False
+        except SpotifyException as e:
+            if getattr(e, "http_status", None) == 429:
+                logging.critical("⛔ Spotify rate limit (429) active.")
+                return False
+            logging.error(f"❌ Spotify API error: {e}")
+            return False
+        except Exception as e:
+            logging.error(f"❌ Spotify connection error: {e}")
             return False
 
     def get_all_playlists(self):
@@ -93,8 +134,6 @@ class SpotdlSync:
 
     def run(self):
         temp_path = Path.home() / ".spotdl" / "temp"
-        if temp_path.exists():
-            shutil.rmtree(temp_path, ignore_errors=True)
         temp_path.mkdir(parents=True, exist_ok=True)
 
         print("\n" + "="*60)
@@ -104,7 +143,7 @@ class SpotdlSync:
         print("="*60)
 
         if not self.spotify.check_initial_rate_limit():
-            logging.critical("⛔ 24-hour Spotify ban active.")
+            logging.critical("⛔ Spotify pre-flight check failed. Sync aborted.")
             return
 
         logging.info("Scanning Spotify library...")
@@ -116,19 +155,26 @@ class SpotdlSync:
                 local_map = json.load(f)
 
         all_names = sorted(self.spotify.target_snapshot_map.keys())
+        pending_count = sum(
+            1 for n in all_names 
+            if n not in local_map or local_map[n]['snapshot_id'] != self.spotify.target_snapshot_map[n]['snapshot_id']
+        )
         
         print("\n" + "="*60)
         print("      SPOTIFY PLAYLIST MENU")
         print("="*60)
-        print("  0. [SYNC ALL PENDING]")
-        print("  F. [FORCE UPDATE ALL]")
-        print("  D. [DEDUPLICATE MP3s]")
+        print(f"  0. [SYNC ALL PENDING ({pending_count} pending)]")
+        print(f"  F. [FORCE UPDATE ALL ({len(all_names)} total)]")
+        print("  D. [DEDUPLICATE TRACKS]")
         for i, name in enumerate(all_names, 1):
             target = self.spotify.target_snapshot_map[name]
             is_up = name in local_map and local_map[name]['snapshot_id'] == target['snapshot_id']
-            print(f"  {i:2}. {'[UP TO DATE]' if is_up else '[PENDING]'} {name[:25]}")
+            status = "[UP TO DATE]" if is_up else "[PENDING]   "
+            track_count = target.get('track_count', '?')
+            print(f"  {i:2}. {status} {name[:30]:<30} ({track_count} tracks)")
         
         choice = input(f"\nSelect 0, F, D, or 1-{len(all_names)}: ").strip().lower()
+
 
         queue = []
         if choice == '0':
@@ -176,8 +222,10 @@ class SpotdlSync:
                 downloaded_files = list(Path(".").glob(f"*.{self.audio_format}"))
                 if len(downloaded_files) > 0:
                     local_map[name] = item
-                    with open(MAP_FILE, 'w') as f: 
+                    temp_map_file = MAP_FILE.with_suffix(".tmp")
+                    with open(temp_map_file, 'w') as f: 
                         json.dump(local_map, f, indent=4, sort_keys=True)
+                    temp_map_file.replace(MAP_FILE)
                     logging.info(f"✅ SUCCESS: {name} ({len(downloaded_files)} files total)\n")
                 else:
                     logging.warning(f"⚠️ {name} completed but 0 files were saved. Snapshot not updated.\n")
@@ -197,7 +245,7 @@ class SpotdlSync:
 
 def get_audio_metadata(file_path):
     """
-    Retrieves duration, bitrate, title, and artist of an audio file using ffprobe.
+    Retrieves duration, bitrate, title, and artist of an audio file using TinyTag.
     Returns a dictionary or None on failure.
     """
     metadata = {
@@ -207,65 +255,99 @@ def get_audio_metadata(file_path):
         "artist": ""
     }
     try:
-        cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration,bit_rate:format_tags=title,artist",
-            "-of", "default=noprint_wrappers=1",
-            str(file_path)
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        for line in result.stdout.strip().splitlines():
-            if "=" in line:
-                key, val = line.split("=", 1)
-                if key == "duration":
-                    metadata["duration"] = float(val)
-                elif key == "bit_rate":
-                    metadata["bitrate"] = int(val) if val.isdigit() else 0
-                elif key == "TAG:title":
-                    metadata["title"] = val.strip()
-                elif key == "TAG:artist":
-                    metadata["artist"] = val.strip()
+        tag = TinyTag.get(str(file_path))
+        metadata["duration"] = float(tag.duration) if tag.duration else 0.0
+        metadata["bitrate"] = int(tag.bitrate * 1000) if tag.bitrate else 0
+        metadata["title"] = tag.title.strip() if tag.title else ""
+        metadata["artist"] = tag.artist.strip() if tag.artist else ""
         return metadata
     except Exception as e:
         logging.warning(f"⚠️ Failed to read metadata for {file_path.name}: {e}")
-    return None
+    return metadata
 
 def normalize_string(s):
     if not s:
         return ""
     s = s.lower()
     # Remove text inside parentheses or brackets like "(feat. ...)" or "[Remastered]"
-    s = re.sub(r'[\(\[][^)]*[\)\]]', '', s)
+    s = re.sub(r'[\(\[\{][^\]\}\)]*[\)\]\}]', '', s)
     # Remove all non-alphanumeric characters
     s = re.sub(r'[^a-z0-9]', '', s)
     return s
 
-def is_duplicate_match(f1, f2):
-    meta1, meta2 = f1["meta"], f2["meta"]
+def clean_title(title):
+    if not title:
+        return ""
+    s = title.lower()
+    # Strip featuring clauses (whether in parentheses or unparenthesized)
+    s = re.sub(r'[\(\[\{]?\b(feat|ft|featuring)\.?\b.*$', '', s)
+    # Strip remaining parenthetical or bracketed text
+    s = re.sub(r'[\(\[\{][^\]\}\)]*[\)\]\}]', '', s)
+    # Strip non-alphanumeric characters
+    s = re.sub(r'[^a-z0-9]', '', s)
+    return s
+
+def clean_artist(artist):
+    if not artist:
+        return set()
+    s = artist.lower()
+    s = re.sub(r'[\(\[\{]?\b(feat|ft|featuring)\.?\b.*$', '', s)
+    # Split by delimiters like commas, &, and, x
+    parts = re.split(r'[,&]|\bx\b|\band\b', s)
+    artists = set()
+    for p in parts:
+        cleaned = re.sub(r'[^a-z0-9]', '', p)
+        if cleaned:
+            artists.add(cleaned)
+    return artists
+
+def parse_audio_file(path):
+    meta = get_audio_metadata(path)
+    stem = path.stem
+    if ' - ' in stem:
+        fn_artist, fn_title = stem.split(' - ', 1)
+    else:
+        fn_artist, fn_title = '', stem
+        
+    title = meta["title"] or fn_title
+    artist = meta["artist"] or fn_artist
     
-    # 1. First enforce that durations must match within 2.0 seconds
-    duration_diff = abs(meta1["duration"] - meta2["duration"])
-    if duration_diff > 2.0:
+    c_title = clean_title(title)
+    if not c_title:
+        c_title = clean_title(fn_title)
+    if not c_title:
+        c_title = normalize_string(stem)
+        
+    artists = clean_artist(artist) | clean_artist(fn_artist) | clean_artist(meta["artist"])
+    
+    return {
+        "path": path,
+        "meta": meta,
+        "c_title": c_title,
+        "artists": artists
+    }
+
+def is_duplicate_match(f1, f2):
+    """
+    Checks if two parsed audio file dicts represent duplicate tracks based on duration, artist overlap, and title.
+    """
+    dur1 = f1["meta"]["duration"]
+    dur2 = f2["meta"]["duration"]
+    if dur1 > 0 and dur2 > 0 and abs(dur1 - dur2) > 4.0:
         return False
         
-    # 2. Compare normalized Title and Artist tags
-    norm_title1 = normalize_string(meta1["title"])
-    norm_title2 = normalize_string(meta2["title"])
-    norm_artist1 = normalize_string(meta1["artist"])
-    norm_artist2 = normalize_string(meta2["artist"])
-    
-    if norm_title1 and norm_title2 and norm_artist1 and norm_artist2:
-        if norm_title1 == norm_title2 and norm_artist1 == norm_artist2:
-            return True
-            
-    # 3. Fallback: Compare normalized filename stems
-    stem1 = normalize_string(f1["path"].stem)
-    stem2 = normalize_string(f2["path"].stem)
-    if stem1 == stem2:
-        return True
+    # Require artist overlap if artist metadata is available on both files
+    if f1["artists"] and f2["artists"]:
+        if not (f1["artists"] & f2["artists"]):
+            return False
+    else:
+        # If artist metadata is missing on either file, require exact normalized stem match
+        stem1 = normalize_string(f1["path"].stem)
+        stem2 = normalize_string(f2["path"].stem)
+        if stem1 != stem2:
+            return False
         
-    return False
+    return True
 
 def resolve_duplicate(f1, f2):
     """
@@ -295,7 +377,17 @@ def resolve_duplicate(f1, f2):
         return f2, f1
 
 def deduplicate_tracks(target_path=None):
-    scan_path = target_path if target_path else BASE_PATH
+    if not target_path:
+        # Run deduplication on each individual playlist directory under BASE_PATH
+        if not BASE_PATH.exists():
+            logging.warning(f"Scan path {BASE_PATH} does not exist. Nothing to deduplicate.")
+            return
+        for item in BASE_PATH.iterdir():
+            if item.is_dir():
+                deduplicate_tracks(item)
+        return
+
+    scan_path = target_path
     logging.info(f"Checking for duplicates under {scan_path}...")
     if not scan_path.exists():
         logging.warning(f"Scan path {scan_path} does not exist. Nothing to deduplicate.")
@@ -306,17 +398,21 @@ def deduplicate_tracks(target_path=None):
     for ext in ["*.m4a", "*.mp3"]:
         all_files.extend(list(scan_path.rglob(ext)))
 
-    # Group files by normalized filename stem
-    groups = {}
-    for path in all_files:
-        if not path.exists():
-            continue
-        stem_norm = normalize_string(path.stem)
-        if stem_norm not in groups:
-            groups[stem_norm] = []
-        groups[stem_norm].append(path)
+    if not all_files:
+        logging.info("✨ Deduplication finished. No audio files found.")
+        return
 
-    # Filter groups to only keep potential duplicate groups (size >= 2)
+    # Parse metadata for all audio files
+    parsed_files = [parse_audio_file(p) for p in all_files if p.exists()]
+
+    # Group files by cleaned title
+    groups = {}
+    for f in parsed_files:
+        t = f["c_title"]
+        if t not in groups:
+            groups[t] = []
+        groups[t].append(f)
+
     duplicate_groups = {k: v for k, v in groups.items() if len(v) >= 2}
 
     if not duplicate_groups:
@@ -325,54 +421,43 @@ def deduplicate_tracks(target_path=None):
 
     logging.info(f"Analyzing {len(duplicate_groups)} potential duplicate group(s)...")
 
-    # Gather metadata ONLY for potential duplicates
-    audio_files = []
-    for stem_norm, paths in duplicate_groups.items():
-        for path in paths:
-            if not path.exists():
-                continue
-            meta = get_audio_metadata(path)
-            if meta:
-                audio_files.append({"path": path, "meta": meta})
-
-    # Sort files by duration to optimize comparison
-    audio_files.sort(key=lambda x: x["meta"]["duration"])
-
     dedup_count = 0
     deleted_paths = set()
 
-    for i in range(len(audio_files)):
-        f1 = audio_files[i]
-        if f1["path"] in deleted_paths or not f1["path"].exists():
-            continue
-            
-        for j in range(i + 1, len(audio_files)):
-            f2 = audio_files[j]
-            if f2["path"] in deleted_paths or not f2["path"].exists():
+    for t, group in duplicate_groups.items():
+        # Sort group by duration to optimize comparison
+        group.sort(key=lambda x: x["meta"]["duration"])
+
+        for i in range(len(group)):
+            f1 = group[i]
+            if f1["path"] in deleted_paths or not f1["path"].exists():
                 continue
-                
-            # If duration difference is > 2 seconds, break the inner loop (since list is sorted)
-            if f2["meta"]["duration"] - f1["meta"]["duration"] > 2.0:
-                break
-                
-            # Check if they match
-            if is_duplicate_match(f1, f2):
-                keep, delete = resolve_duplicate(f1, f2)
-                
-                br_keep = f"{keep['meta']['bitrate'] // 1000}kbps" if keep['meta']['bitrate'] else "unknown"
-                br_del = f"{delete['meta']['bitrate'] // 1000}kbps" if delete['meta']['bitrate'] else "unknown"
-                
-                logging.info(
-                    f"🗑️ Duplicate found: Removing '{delete['path'].name}' ({br_del}) "
-                    f"in favor of '{keep['path'].name}' ({br_keep})"
-                )
-                try:
-                    delete["path"].unlink()
-                    deleted_paths.add(delete["path"])
-                    dedup_count += 1
-                except Exception as e:
-                    logging.error(f"❌ Failed to delete {delete['path']}: {e}")
-                    
+
+            for j in range(i + 1, len(group)):
+                f2 = group[j]
+                if f2["path"] in deleted_paths or not f2["path"].exists():
+                    continue
+
+                if is_duplicate_match(f1, f2):
+                    keep, delete = resolve_duplicate(f1, f2)
+
+                    br_keep = f"{keep['meta']['bitrate'] // 1000}kbps" if keep['meta']['bitrate'] else "unknown"
+                    br_del = f"{delete['meta']['bitrate'] // 1000}kbps" if delete['meta']['bitrate'] else "unknown"
+
+                    logging.info(
+                        f"🗑️ Duplicate found: Removing '{delete['path'].name}' ({br_del}) "
+                        f"in favor of '{keep['path'].name}' ({br_keep})"
+                    )
+                    try:
+                        delete["path"].unlink()
+                        deleted_paths.add(delete["path"])
+                        dedup_count += 1
+                    except Exception as e:
+                        logging.error(f"❌ Failed to delete {delete['path']}: {e}")
+
+                    if delete["path"] == f1["path"]:
+                        break
+
     logging.info(f"✨ Deduplication finished. Removed {dedup_count} duplicate file(s).")
 
 if __name__ == "__main__":
@@ -389,4 +474,9 @@ if __name__ == "__main__":
     selected_fmt = "mp3" if fmt_input == "2" else "m4a"
     selected_bitrate = "128k" if selected_fmt == "mp3" else "disable"
 
-    SpotdlSync(audio_format=selected_fmt, bitrate=selected_bitrate).run()
+    try:
+        SpotdlSync(audio_format=selected_fmt, bitrate=selected_bitrate).run()
+    except KeyboardInterrupt:
+        print("\n\n👋 Sync interrupted by user. Exiting cleanly.")
+        sys.exit(0)
+

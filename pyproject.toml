@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Sync Spotify playlists to local storage"
 requires-python = ">=3.13"
 dependencies = [
+    "python-dotenv>=1.2.2",
     "spotdl",
     "spotipy",
+    "tinytag>=2.2.1",
 ]
