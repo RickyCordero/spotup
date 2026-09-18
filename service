@@ -1,0 +1,17 @@
+[Unit]
+After=network.target
+Description=Dropbox System Service %i
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/dropbox start
+ExecStop=/usr/local/bin/dropbox stop
+User=root
+Group=%i
+# 'LANG' might be unnecessary, since systemd already sets the
+# locale for all services according to "/etc/locale.conf".
+# Run `systemctl show-environment` to make sure.
+Environment=LANG=en_US.utf-8
+
+[Install]
+WantedBy=multi-user.target

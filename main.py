@@ -81,7 +81,7 @@ class SpotifyClient:
             return True
         except SpotifyOauthError as e:
             logging.warning("🔑 Spotify authorization token in '.cache' is invalid or revoked.")
-            cache_path = Path(".cache")
+            cache_path = Path(__file__).resolve().parent / ".cache"
             if cache_path.exists():
                 logging.info("Removing stale .cache file for re-authentication...")
                 cache_path.unlink(missing_ok=True)
@@ -133,8 +133,6 @@ class SpotdlSync:
         sys.stdout.write("\r" + " " * 85 + "\r")
 
     def run(self):
-        temp_path = Path.home() / ".spotdl" / "temp"
-        temp_path.mkdir(parents=True, exist_ok=True)
 
         print("\n" + "="*60)
         print(f"📂 DESTINATION: {BASE_PATH}")
@@ -187,6 +185,9 @@ class SpotdlSync:
         elif choice.isdigit() and 1 <= int(choice) <= len(all_names):
             name = all_names[int(choice)-1]
             queue = [name]
+        else:
+            logging.warning(f"⚠️ Invalid selection '{choice}'. Exiting.")
+            return
 
         original_cwd = os.getcwd()
 
@@ -217,16 +218,18 @@ class SpotdlSync:
                 )
                 
                 songs = spotdl_instance.search([item['url']])
+                files_before = set(Path(".").glob(f"*.{self.audio_format}"))
                 spotdl_instance.download_songs(songs)
-                
-                downloaded_files = list(Path(".").glob(f"*.{self.audio_format}"))
-                if len(downloaded_files) > 0:
+                files_after = set(Path(".").glob(f"*.{self.audio_format}"))
+                newly_downloaded = files_after - files_before
+
+                if files_after:
                     local_map[name] = item
                     temp_map_file = MAP_FILE.with_suffix(".tmp")
                     with open(temp_map_file, 'w') as f: 
                         json.dump(local_map, f, indent=4, sort_keys=True)
                     temp_map_file.replace(MAP_FILE)
-                    logging.info(f"✅ SUCCESS: {name} ({len(downloaded_files)} files total)\n")
+                    logging.info(f"✅ SUCCESS: {name} ({len(newly_downloaded)} new, {len(files_after)} total)\n")
                 else:
                     logging.warning(f"⚠️ {name} completed but 0 files were saved. Snapshot not updated.\n")
 
@@ -257,7 +260,7 @@ def get_audio_metadata(file_path):
     try:
         tag = TinyTag.get(str(file_path))
         metadata["duration"] = float(tag.duration) if tag.duration else 0.0
-        metadata["bitrate"] = int(tag.bitrate * 1000) if tag.bitrate else 0
+        metadata["bitrate"] = int(tag.bitrate) if tag.bitrate else 0
         metadata["title"] = tag.title.strip() if tag.title else ""
         metadata["artist"] = tag.artist.strip() if tag.artist else ""
         return metadata
@@ -441,8 +444,8 @@ def deduplicate_tracks(target_path=None):
                 if is_duplicate_match(f1, f2):
                     keep, delete = resolve_duplicate(f1, f2)
 
-                    br_keep = f"{keep['meta']['bitrate'] // 1000}kbps" if keep['meta']['bitrate'] else "unknown"
-                    br_del = f"{delete['meta']['bitrate'] // 1000}kbps" if delete['meta']['bitrate'] else "unknown"
+                    br_keep = f"{keep['meta']['bitrate']}kbps" if keep['meta']['bitrate'] else "unknown"
+                    br_del = f"{delete['meta']['bitrate']}kbps" if delete['meta']['bitrate'] else "unknown"
 
                     logging.info(
                         f"🗑️ Duplicate found: Removing '{delete['path'].name}' ({br_del}) "

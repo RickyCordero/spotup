@@ -1,0 +1,1 @@
+rsync -a /mnt/c/Users/ricky/Music/Songs/FL\ Studio\ Rendered/ ricky@104.236.89.173:"/home/ricky/music/FL Studio Rendered/"
