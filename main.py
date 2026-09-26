@@ -13,6 +13,8 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.exceptions import SpotifyOauthError, SpotifyException
 from spotdl import Spotdl
+from spotdl.types.playlist import Playlist
+from spotdl.utils.formatter import create_file_name
 from tinytag import TinyTag
 from dotenv import load_dotenv
 
@@ -132,6 +134,44 @@ class SpotdlSync:
             time.sleep(1)
         sys.stdout.write("\r" + " " * 85 + "\r")
 
+    def _index_local_directory(self, directory: Path):
+        files = list(directory.glob("*.m4a")) + list(directory.glob("*.mp3"))
+        exact_stems = {f.stem.lower() for f in files}
+        title_index = {}
+        for f in files:
+            stem = f.stem
+            if ' - ' in stem:
+                fn_artist, fn_title = stem.split(' - ', 1)
+            else:
+                fn_artist, fn_title = '', stem
+            ct = clean_title(fn_title) or normalize_string(stem)
+            ca = clean_artist(fn_artist)
+            if ct not in title_index:
+                title_index[ct] = []
+            title_index[ct].append((ca, f))
+        return files, exact_stems, title_index
+
+    def _filter_missing_songs(self, songs, exact_stems, title_index):
+        missing = []
+        for s in songs:
+            target_stem = create_file_name(s, "{artists} - {title}", self.audio_format).stem.lower()
+            if target_stem in exact_stems:
+                continue
+            ct = clean_title(s.name) or normalize_string(s.name)
+            candidates = title_index.get(ct, [])
+            if not candidates:
+                missing.append(s)
+                continue
+            song_artists = clean_artist(' '.join(s.artists if s.artists else [s.artist]))
+            matched = False
+            for file_artists, _ in candidates:
+                if not song_artists or not file_artists or (song_artists & file_artists):
+                    matched = True
+                    break
+            if not matched:
+                missing.append(s)
+        return missing
+
     def run(self):
 
         print("\n" + "="*60)
@@ -173,12 +213,13 @@ class SpotdlSync:
         
         choice = input(f"\nSelect 0, F, D, or 1-{len(all_names)}: ").strip().lower()
 
-
         queue = []
+        force_mode = False
         if choice == '0':
             queue = [n for n in all_names if n not in local_map or local_map[n]['snapshot_id'] != self.spotify.target_snapshot_map[n]['snapshot_id']]
         elif choice == 'f':
             queue = all_names
+            force_mode = True
         elif choice == 'd':
             deduplicate_tracks()
             return
@@ -216,12 +257,48 @@ class SpotdlSync:
                         "output": "{artists} - {title}"
                     }
                 )
+
+                # Fetch playlist song metadata via Spotify API
+                _, songs = Playlist.get_metadata(item['url'])
+                total_playlist_songs = len(songs)
+
+                files_before, exact_stems, title_index = self._index_local_directory(playlist_dir)
                 
-                songs = spotdl_instance.search([item['url']])
-                files_before = set(Path(".").glob(f"*.{self.audio_format}"))
-                spotdl_instance.download_songs(songs)
-                files_after = set(Path(".").glob(f"*.{self.audio_format}"))
-                newly_downloaded = files_after - files_before
+                if force_mode:
+                    missing_songs = songs
+                else:
+                    missing_songs = self._filter_missing_songs(songs, exact_stems, title_index)
+
+                logging.info(
+                    f"📊 Library State: {total_playlist_songs} total Spotify tracks, "
+                    f"{len(files_before)} existing local files, {len(missing_songs)} to download."
+                )
+
+                newly_downloaded_count = 0
+                download_errors = 0
+
+                if missing_songs:
+                    chunk_size = 25
+                    for chunk_idx in range(0, len(missing_songs), chunk_size):
+                        chunk = missing_songs[chunk_idx:chunk_idx + chunk_size]
+                        chunk_num = (chunk_idx // chunk_size) + 1
+                        total_chunks = (len(missing_songs) + chunk_size - 1) // chunk_size
+                        
+                        logging.info(
+                            f"⬇️ Processing batch {chunk_num}/{total_chunks} "
+                            f"({len(chunk)} tracks)..."
+                        )
+                        
+                        results = spotdl_instance.download_songs(chunk)
+                        successful_in_chunk = sum(1 for _, path in results if path is not None)
+                        newly_downloaded_count += successful_in_chunk
+
+                        if chunk_idx + chunk_size < len(missing_songs):
+                            self.visual_countdown(random.uniform(3, 6), "Batch Rate Limit Cooldown")
+                else:
+                    logging.info("✨ All tracks already up to date locally.")
+
+                files_after = list(playlist_dir.glob(f"*.{self.audio_format}")) + list(playlist_dir.glob("*.mp3"))
 
                 if files_after:
                     local_map[name] = item
@@ -229,13 +306,13 @@ class SpotdlSync:
                     with open(temp_map_file, 'w') as f: 
                         json.dump(local_map, f, indent=4, sort_keys=True)
                     temp_map_file.replace(MAP_FILE)
-                    logging.info(f"✅ SUCCESS: {name} ({len(newly_downloaded)} new, {len(files_after)} total)\n")
+                    logging.info(f"✅ SUCCESS: {name} ({newly_downloaded_count} new, {len(files_after)} total)\n")
                 else:
                     logging.warning(f"⚠️ {name} completed but 0 files were saved. Snapshot not updated.\n")
 
             except Exception as e:
                 if "429" in str(e) or "Too Many Requests" in str(e):
-                    logging.error("⛔ YOUTUBE RATE LIMIT BAN. Stopping script to prevent deeper ban.")
+                    logging.error("⛔ YOUTUBE/SPOTIFY RATE LIMIT (429). Terminating to prevent ban.")
                     sys.exit(1)
                 logging.error(f"❌ Error syncing {name}: {e}")
             finally:
