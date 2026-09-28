@@ -4,6 +4,7 @@ import random
 import time
 import sys
 import logging
+from logging.handlers import RotatingFileHandler
 import shutil
 import subprocess
 import re
@@ -15,6 +16,8 @@ from spotipy.exceptions import SpotifyOauthError, SpotifyException
 from spotdl import Spotdl
 from spotdl.types.playlist import Playlist
 from spotdl.utils.formatter import create_file_name
+from rich.console import Console
+from rich.logging import RichHandler
 from tinytag import TinyTag
 from dotenv import load_dotenv
 
@@ -22,10 +25,41 @@ load_dotenv()
 
 
 # --- 1. LOGGING & SAFETY GATE ---
-log_format = '%(asctime)s | %(levelname)s | %(message)s'
-logging.basicConfig(level=logging.INFO, format=log_format, datefmt='%H:%M:%S', stream=sys.stdout)
-logging.getLogger("spotipy").setLevel(logging.CRITICAL)
-logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+LOG_FILE = Path(__file__).resolve().parent / "spotup.log"
+console = Console(stderr=False)
+
+# File handler with rotation (capped at 5MB, keeps 3 backups so logs never grow indefinitely)
+file_formatter = logging.Formatter(
+    fmt='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+file_handler = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=5 * 1024 * 1024,  # 5 MB max per file
+    backupCount=3,
+    encoding='utf-8'
+)
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(file_formatter)
+
+# Rich terminal handler so log lines don't collide with or tear the active Rich progress bars
+rich_console_handler = RichHandler(
+    console=console,
+    show_time=True,
+    show_level=True,
+    show_path=False,
+    markup=False,
+    rich_tracebacks=True
+)
+rich_console_handler.setLevel(logging.INFO)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+# Remove any default handlers to prevent duplicate lines
+root_logger.handlers = [rich_console_handler, file_handler]
+
+logging.getLogger("spotipy").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("spotdl").setLevel(logging.INFO) 
 # Check local spotdl configuration directories for ffmpeg first
 local_ffmpeg_paths = [
